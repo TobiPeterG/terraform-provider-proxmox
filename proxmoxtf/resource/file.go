@@ -32,6 +32,7 @@ import (
 
 	"github.com/bpg/terraform-provider-proxmox/proxmox"
 	"github.com/bpg/terraform-provider-proxmox/proxmox/api"
+	nodestorage "github.com/bpg/terraform-provider-proxmox/proxmox/nodes/storage"
 	"github.com/bpg/terraform-provider-proxmox/proxmox/storage"
 	"github.com/bpg/terraform-provider-proxmox/proxmox/version"
 	"github.com/bpg/terraform-provider-proxmox/proxmoxtf"
@@ -361,6 +362,11 @@ func fileCreate(ctx context.Context, d *schema.ResourceData, m any) diag.Diagnos
 
 	contentType, dg := fileGetContentType(ctx, d, capi)
 	diags = append(diags, dg...)
+
+	nodeName, err = fileResolveNode(ctx, capi, nodeName, datastoreID, contentType)
+	if err != nil {
+		return diag.FromErr(err)
+	}
 
 	list, err := capi.Node(nodeName).Storage(datastoreID).ListDatastoreFiles(ctx, contentType)
 	if err != nil {
@@ -813,6 +819,73 @@ func fileIsURL(d *schema.ResourceData) bool {
 		strings.HasPrefix(sourceFilePath, "https://")
 }
 
+// fileResolveNode preserves the preferred node while it remains a cluster member.
+func fileResolveNode(ctx context.Context, client proxmox.Client, preferredNode, datastoreID string, contentType *string) (string, error) {
+	nodes, err := client.Node("").ListNodes(ctx)
+	if err != nil {
+		return "", err
+	}
+
+	for _, node := range nodes {
+		if node.Name == preferredNode {
+			return preferredNode, nil
+		}
+	}
+
+	// Refresh receives state, not the current resource configuration, so a newly configured node cannot be a fallback.
+	// Automatic discovery is therefore needed to recover without manual state repair when the recorded node is removed.
+	// Keep node_name in state unchanged: it is ForceNew, and changing it would cause replacement against configuration.
+	datastore, err := client.Storage().GetDatastore(ctx, &storage.DatastoreGetRequest{ID: &datastoreID})
+	if err != nil {
+		return "", err
+	}
+
+	if datastore.Disable != nil && bool(*datastore.Disable) {
+		return "", fmt.Errorf("datastore %q is disabled", datastoreID)
+	}
+
+	candidateErrors := []error{fmt.Errorf(
+		"node %q is no longer available and no online node exposes shared datastore %q with the required content type",
+		preferredNode, datastoreID,
+	)}
+
+	// ListNodes sorts by name, making the fallback stable across refreshes.
+	for _, node := range nodes {
+		if node.Status == nil || *node.Status != "online" {
+			continue
+		}
+
+		if datastore.Nodes != nil && len(*datastore.Nodes) > 0 && !slices.Contains(*datastore.Nodes, node.Name) {
+			continue
+		}
+
+		list, err := client.Node(node.Name).Storage(datastoreID).ListDatastores(ctx, &nodestorage.DatastoreListRequestBody{ID: &datastoreID})
+		if err != nil {
+			candidateErrors = append(candidateErrors, fmt.Errorf("node %q: %w", node.Name, err))
+			continue
+		}
+
+		for _, ds := range list {
+			if ds.ID != datastoreID || ds.Shared == nil || !bool(*ds.Shared) ||
+				ds.Enabled == nil || !bool(*ds.Enabled) || ds.Active == nil || !bool(*ds.Active) {
+				continue
+			}
+
+			if contentType != nil && (ds.ContentTypes == nil || !slices.Contains(*ds.ContentTypes, *contentType)) {
+				continue
+			}
+
+			tflog.Debug(ctx, "using shared datastore through another node", map[string]any{
+				"original_node": preferredNode, "node": node.Name, "datastore": datastoreID,
+			})
+
+			return node.Name, nil
+		}
+	}
+
+	return "", errors.Join(candidateErrors...)
+}
+
 func fileRead(ctx context.Context, d *schema.ResourceData, m any) diag.Diagnostics {
 	config := m.(proxmoxtf.ProviderConfiguration)
 
@@ -830,6 +903,11 @@ func fileRead(ctx context.Context, d *schema.ResourceData, m any) diag.Diagnosti
 	var contentType *string
 	if contentTypeStr != "" {
 		contentType = &contentTypeStr
+	}
+
+	nodeName, err = fileResolveNode(ctx, capi, nodeName, datastoreID, contentType)
+	if err != nil {
+		return diag.FromErr(err)
 	}
 
 	list, err := capi.Node(nodeName).Storage(datastoreID).ListDatastoreFiles(ctx, contentType)
@@ -1009,6 +1087,16 @@ func fileDelete(ctx context.Context, d *schema.ResourceData, m any) diag.Diagnos
 
 	datastoreID := d.Get(mkResourceVirtualEnvironmentFileDatastoreID).(string)
 	nodeName := d.Get(mkResourceVirtualEnvironmentFileNodeName).(string)
+
+	volumeID, err := fileParseVolumeID(d.Id())
+	if err != nil {
+		return diag.FromErr(err)
+	}
+
+	nodeName, err = fileResolveNode(ctx, capi, nodeName, datastoreID, &volumeID.contentType)
+	if err != nil {
+		return diag.FromErr(err)
+	}
 
 	err = capi.Node(nodeName).Storage(datastoreID).DeleteDatastoreFile(ctx, d.Id()).Err()
 	if err != nil && !errors.Is(err, api.ErrResourceDoesNotExist) {
